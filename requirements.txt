@@ -1,0 +1,14 @@
+numpy<2
+opencv-python
+albumentations
+timm
+transformers==4.36.2
+tokenizers
+tqdm
+matplotlib
+scikit-image
+einops
+huggingface_hub
+PyYAML
+scipy
+# CONCH (install separately): pip install -e /path/to/CONCH

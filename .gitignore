@@ -1,0 +1,23 @@
+# Training/evaluation outputs
+outputs/
+data/patches/
+checkpoint_dir/
+**/checkpoint_dir/
+__pycache__/
+**/__pycache__/
+
+# Visualization outputs
+viz_out/
+visualize/
+visualization/
+**/viz_out/
+**/visualize/
+**/visualization/
+CONCH/
+
+#uv file
+.python-version
+pyproject.toml
+uv.lock
+
+.env
