@@ -20,6 +20,7 @@ diffusion:
   base_ch: 64
   batch_size: 4
   lr: 1.0e-4
+  weight_decay: 1.0e-3
   depth: 4
 
 segmentation:
@@ -31,8 +32,10 @@ segmentation:
   val_batch_size: 4
   accum_steps: 1
   grad_checkpointing: false
-  lr: 3.0e-5
-  lr_unfrozen: 3.0e-6
+  lr: 1.0e-4
+  weight_decay: 1.0e-3
+  lr_unfrozen: 1.0e-5
+  weight_decay_unfrozen: 1.0e-4
   # false    – encoder never frozen
   # "partly" – frozen during warmup, unfrozen after (requires is_warmup: true)
   # true     – encoder frozen for the whole training
@@ -43,18 +46,33 @@ segmentation:
 loss:
   lambda_pseudo: 0.1
   lambda_view: 0.1
-  lambda_bound: 1.0
-  lambda_cldice: 0.5
+  lambda_bound: 0.5
+  lambda_cldice: 1.0
   lambda_bce: 1.0
   lambda_dice: 1.0
-  tau_max: 0.9
-  tau_min: 0.7
   cldice_iters: 3
+  # Consistency loss type for the unsupervised terms — applied to BOTH
+  # loss_refined_unsup (pseudo-label loss) and loss_view_unsup (cross-view):
+  #   traditional – BCE + Dice (hard 0/1 pseudo-label & view consistency; default)
+  #   soft        – CorrMatch-style KL soft supervision on the soft (un-thresholded)
+  #                 refined/teacher distribution within high-confidence pixels
+  #   combined    – traditional + lambda_soft * soft
+  # Use a list (e.g. [traditional, soft, combined]) to make it an ablation axis.
+  consistency_type: traditional
+  lambda_soft: 0.9      # weight of the soft term in 'combined' mode
+  # Confidence-threshold curriculum (hybrid: strict warmup -> percentile).
+  # Strict phase uses tau_max; percentile phase keeps the top keep_frac of the
+  # most-confident refined pixels per image, clamped to [tau_min, tau_max].
+  tau_max: 0.95           # strict ceiling + threshold during strict warmup
+  tau_min: 0.70           # relaxed floor (clamp)
+  conf_strict_epochs: 5   # semi-sup epochs held strictly at tau_max
+  keep_frac_min: 0.10     # start: keep top 10% most-confident pixels
+  keep_frac_max: 0.60     # end: keep top 60%
 
 train:
   epochs: 100
   warmup_epochs: 10
-  patience: 25
+  patience: 10
   noise_frac: 0.4
   grad_clip: 1.0
   num_workers: 2
@@ -66,14 +84,14 @@ train:
   # the model (ema_model) instead of the current student. This stabilises the
   # pseudo-label target and avoids the moving-target problem.
   # Set false to revert to student-generated pseudo-labels.
-  use_ema_teacher: false
+  use_ema_teacher: true
   ema_alpha: 0.999        # weight of old teacher; higher = slower update
   # pseudo-label ablation (only when use_diffusion: true):
   #   strong_weak   – strong logits vs refined weak mask (FixMatch, default)
   #   weak_weak     – weak logits vs refined weak mask (DiffRect L_Rect)
   #   strong_strong – strong logits vs refined strong mask (self-distillation)
   #   diffrect      – weak_weak + strong_weak combined
-  pseudo_ablation: weak_weak
+  pseudo_ablation: diffrect
 
 text:
   # Set false to disable CONCH text encoder and TextGuidedFusion entirely.

@@ -19,7 +19,8 @@ diffusion:
   T: 100
   base_ch: 64
   batch_size: 4
-  lr: 2.0e-4
+  lr: 1.0e-4
+  weight_decay: 1.0e-3
   depth: 4
 
 segmentation:
@@ -31,8 +32,10 @@ segmentation:
   val_batch_size: 8
   accum_steps: 1
   grad_checkpointing: false
-  lr: 1.0e-5
-  lr_unfrozen: 5.0e-6
+  lr: 1.0e-4
+  weight_decay: 1.0e-3
+  lr_unfrozen: 1.0e-4
+  weight_decay_unfrozen: 1.0e-3
   # false    – encoder never frozen
   # "partly" – frozen during warmup, unfrozen after (requires is_warmup: true)
   # true     – encoder frozen for the whole training
@@ -47,9 +50,15 @@ loss:
   lambda_cldice: 0.5
   lambda_bce: 1.0
   lambda_dice: 1.0
-  tau_max: 0.9
-  tau_min: 0.7
   cldice_iters: 3
+  # Confidence-threshold curriculum (hybrid: strict warmup -> percentile).
+  # Strict phase uses tau_max; percentile phase keeps the top keep_frac of the
+  # most-confident refined pixels per image, clamped to [tau_min, tau_max].
+  tau_max: 0.95           # strict ceiling + threshold during strict warmup
+  tau_min: 0.70           # relaxed floor (clamp)
+  conf_strict_epochs: 5   # semi-sup epochs held strictly at tau_max
+  keep_frac_min: 0.10     # start: keep top 10% most-confident pixels
+  keep_frac_max: 0.60     # end: keep top 60%
 
 train:
   epochs: 100

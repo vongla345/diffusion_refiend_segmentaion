@@ -1,0 +1,67 @@
+seed: 42
+dataset: glas
+hf:
+  token: ${hf_token}
+paths:
+  data_root: /home/nhanph/Workspace/AIVN Research/Self_Supervised/Research/dataset/glas/dataset_10
+  checkpoint_dir: ./outputs/checkpoints/glas/pseudo_ablation__20260609_093407/pseudo_ablation=strong_strong
+  log_dir: ./outputs/logs/glas/pseudo_ablation__20260609_093407/pseudo_ablation=strong_strong
+patch:
+  size: 256
+  crop_retry: 1
+  min_fg_ratio: 0.0
+diffusion:
+  T: 100
+  base_ch: 64
+  batch_size: 4
+  lr: 0.0001
+  depth: 4
+segmentation:
+  decoder: deeplabv3
+  aspp:
+    aspp_out: 256
+    rates:
+    - 6
+    - 12
+    - 18
+  batch_size: 4
+  val_batch_size: 4
+  accum_steps: 1
+  grad_checkpointing: false
+  lr: 3.0e-05
+  lr_unfrozen: 3.0e-06
+  freeze_enc: partly
+  max_repeat: 10
+  use_pyramid_feature: false
+loss:
+  lambda_pseudo: 0.1
+  lambda_view: 0.1
+  lambda_bound: 1.0
+  lambda_cldice: 0.5
+  lambda_bce: 1.0
+  lambda_dice: 1.0
+  tau_max: 0.9
+  tau_min: 0.7
+  cldice_iters: 3
+train:
+  epochs: 100
+  warmup_epochs: 10
+  patience: 25
+  noise_frac: 0.4
+  grad_clip: 1.0
+  num_workers: 2
+  is_warmup: true
+  use_diffusion: true
+  use_ema_teacher: true
+  ema_alpha: 0.999
+  pseudo_ablation: strong_strong
+text:
+  use_text_encoder: false
+  prompt_template: a histopathology image of {class_name}
+  class_names:
+  - gland
+  - background
+  - lumen
+infer:
+  patch_size: 256
+  stride: 128

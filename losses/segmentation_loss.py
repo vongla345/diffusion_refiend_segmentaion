@@ -37,8 +37,7 @@ class BoundaryLoss(nn.Module):
         boundary = (dilated - eroded).clamp(0, 1)
         
         bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-        boundary_loss = bce_loss * boundary
-        return boundary_loss.mean()
+        return (bce_loss * boundary).sum()/(boundary.sum() + 1e-6)
 
 
 class SegmentationLoss(nn.Module):
@@ -76,7 +75,24 @@ class SegmentationLoss(nn.Module):
 
 
 def view_consistency_loss(logits_a, logits_b):
-    return F.mse_loss(logits_a, logits_b)
+    """Cross-view consistency in probability space (bounded, >= 0).
+
+    Pulls the strong view (``logits_b``, student) toward the weak view
+    (``logits_a``, teacher) with BCE + Dice on probabilities. The weak view is
+    detached so it acts as a fixed soft target (FixMatch / Mean-Teacher style),
+    which keeps the loss bounded and stops the two views from inflating their
+    logits together.
+
+    NOTE: the previous version fed raw logits as the BCE target and computed
+    Dice on raw logits — both unbounded below — which drove a logit-inflation
+    collapse once this loss actually backpropagated (negative ``loss_view``).
+    """
+    target = torch.sigmoid(logits_a).detach()
+    bce = F.binary_cross_entropy_with_logits(logits_b, target)
+    prob = torch.sigmoid(logits_b)
+    inter = (prob * target).sum()
+    dice = 1 - (2 * inter + 1) / (prob.sum() + target.sum() + 1)
+    return bce + dice
 
 
 def compute_masked_pseudo_loss(
@@ -92,3 +108,45 @@ def compute_masked_pseudo_loss(
     inter = (prob * tv).sum()
     dice = 1 - (2 * inter + 1) / (prob.sum() + tv.sum() + 1)
     return bce + dice
+
+
+def soft_consistency_loss(
+    logits,
+    target_prob,
+    valid_mask: Optional[torch.Tensor] = None,
+    eps: float = 1e-6,
+) -> Optional[torch.Tensor]:
+    """CorrMatch-style soft supervision (Eq. 3 of the CorrMatch paper).
+
+    Instead of hardening the teacher prediction to a 0/1 pseudo-label and
+    discarding the distribution information, this matches the *soft* teacher
+    distribution with a per-pixel Kullback-Leibler divergence, restricted to
+    high-confidence pixels (``valid_mask``).
+
+    For binary segmentation every pixel is a Bernoulli distribution, so the KL
+    reduces to the closed form below. The teacher (``target_prob``) is detached
+    so gradients only update the student (``logits``):
+
+        KL(teacher || student)
+          = q*log(q/p) + (1-q)*log((1-q)/(1-p))
+
+    where ``p = sigmoid(logits)`` (student) and ``q = target_prob`` (teacher).
+
+    Args:
+        logits:      student logits, shape (B, 1, H, W).
+        target_prob: teacher probabilities in [0, 1], same shape as ``logits``.
+        valid_mask:  optional high-confidence mask (B, 1, H, W); when given the
+                     KL is averaged over valid pixels only. Returns ``None`` if
+                     no pixel is valid.
+    """
+    p = torch.sigmoid(logits).clamp(eps, 1.0 - eps)
+    q = target_prob.detach().clamp(eps, 1.0 - eps)
+    kl = q * (torch.log(q) - torch.log(p)) + (1 - q) * (
+        torch.log(1 - q) - torch.log(1 - p)
+    )
+    if valid_mask is not None:
+        valid = valid_mask > 0.5
+        if valid.sum() == 0:
+            return None
+        return kl[valid].mean()
+    return kl.mean()

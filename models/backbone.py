@@ -115,86 +115,6 @@ class TextGuidedFusion(nn.Module):
         h, _ = self.attn(q, k, v)
         h = self.norm(q + h)
         return img_feat + self.proj_out(h)
-    
-    
-class QFormerLayer(nn.Module):
-    """
-    A layer of Q-Former. Includes:
-    1. Self-Attention: Queries communicate with each other.
-    2. Cross-Attention: Queries extract information from the image.
-    3. Feed Forward: Non-linear processing.
-    """
-    def __init__(self, hidden_dim, num_heads=8):
-        super().__init__()
-        # 1. Self-Attention (Query-to-Query)
-        self.self_attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        
-        # 2. Cross-Attention (Query-to-Vision)
-        self.cross_attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        
-        # 3. Feed Forward Network (FFN)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4),
-            nn.GELU(),
-            nn.Linear(hidden_dim * 4, hidden_dim)
-        )
-        self.norm3 = nn.LayerNorm(hidden_dim)
-
-    def forward(self, query, vision_features):
-        # Bước 1: Các queries tự chú ý lẫn nhau (Self-Attention)
-        q_self, _ = self.self_attn(query, query, query)
-        query = self.norm1(query + q_self)
-        
-        # Bước 2: Queries đi lấy thông tin từ hình ảnh (Cross-Attention)
-        # Query đi hỏi (Q = query), Ảnh trả lời (K = V = vision_features)
-        q_cross, _ = self.cross_attn(query, vision_features, vision_features)
-        query = self.norm2(query + q_cross)
-        
-        # Bước 3: Đi qua mạng FFN
-        q_ffn = self.ffn(query)
-        query = self.norm3(query + q_ffn)
-        
-        return query
-
-
-class QFormer(nn.Module):
-    """
-    """
-    def __init__(self, hidden_dim, img_dim, num_layers=4, num_queries=256):
-        super().__init__()
-        
-        # Khởi tạo các vector truy vấn CÓ THỂ HỌC ĐƯỢC (Learnable Queries)
-        # Đây chính là "chìa khóa" của BLIP-2. Chúng ta khởi tạo ngẫu nhiên nhưng mạng sẽ tự cập nhật.
-        self.learnable_queries = nn.Parameter(torch.randn(1, num_queries, hidden_dim))
-        
-        # Lớp ánh xạ đưa đặc trưng ảnh về cùng số chiều với query nếu cần
-        self.vision_proj = nn.Linear(img_dim, hidden_dim) if img_dim != hidden_dim else nn.Identity()
-        
-        # Xếp chồng nhiều lớp Q-Former Layers
-        self.layers = nn.ModuleList([
-            QFormerLayer(hidden_dim) for _ in range(num_layers)
-        ])
-
-    def forward(self, img_feat: torch.Tensor):
-        """
-        """
-        batch_size = img_feat.shape[0]
-        
-        # Ánh xạ ảnh về cùng hidden_dim
-        img_feat = self.vision_proj(img_feat)
-        
-        # Nhân bản learnable queries cho từng mẫu trong batch
-        # Kích thước: (Batch, Num_Queries, Hidden_Dim)
-        queries = self.learnable_queries.expand(batch_size, -1, -1)
-        
-        # Cho queries đi qua từng lớp để liên tục hút thông tin từ ảnh
-        for layer in self.layers:
-            queries = layer(queries, img_feat)
-            
-        # Đầu ra là tập hợp các queries đã mang đầy đủ thông tin hình ảnh được nén gọn
-        return queries
 
 
 class SegmentationModel(nn.Module):
@@ -231,10 +151,6 @@ class SegmentationModel(nn.Module):
             for p in self.encoder.parameters():
                 p.requires_grad = False
 
-        self.q_former = QFormer(
-            hidden_dim=self.enc_dim,
-            img_dim=self.enc_dim,
-        )
         if use_text_encoder:
             self.prompt_offset = nn.Parameter(torch.zeros(1, 1, txt_emb_dim))
             self.fusion = TextGuidedFusion(self.enc_dim, txt_emb_dim, heads=4)
@@ -281,13 +197,6 @@ class SegmentationModel(nn.Module):
             feats = self.encoder.forward_features(x)
             n_patches = (h // 16) * (w // 16)
             tokens = feats[:, -n_patches:, :]
-        
-        # using q_former
-        #feats = self.encoder.forward_features(x)
-        # tokens = feats[:, -n_patches:, :]
-        # q_former_out = self.q_former(tokens)
-        # fused = self.fusion(q_former_out, txt_emb)
-        # grid = int(math.sqrt(q_former_out.shape[1]))
         
         if self.use_text_encoder and txt_emb is not None:
             txt_emb = txt_emb + self.prompt_offset

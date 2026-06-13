@@ -1,35 +1,56 @@
 #!/usr/bin/env python3
 """
-Run pseudo-label ablation experiments (one training job per mode).
+Generic ablation runner driven by list-valued fields in a single YAML config.
 
-Modes (train.pseudo_ablation):
-    strong_weak   – FixMatch: strong logits vs refined weak mask
-    weak_weak     – DiffRect L_Rect: weak logits vs refined weak mask
-    strong_strong – self-distillation: strong logits vs refined strong mask
-    diffrect      – weak_weak + strong_weak combined
+Rules
+-----
+* Any leaf in the config whose value is a *list* becomes an ablation axis,
+  EXCEPT the explicitly excluded data lists (segmentation.aspp.rates and
+  text.class_names), which are passed through unchanged.
+* All axes are combined as a Cartesian product, one training job per
+  combination. For example::
 
-Uses pre-made configs in configs/ablations/ when present, otherwise generates
-them from a base YAML (same idea as run_sweep.py but isolated from that grid).
+      use_pyramid_feature: [true, false]                  -> 2 runs
+      use_text_encoder: [true, false]                      -> 4 runs
+      use_ema_teacher:  [true, false]                         (2 x 2)
 
-Usage:
-    # Run all 4 GLAS ablations (configs/ablations/glas_*.yaml)
-    python scripts/run_ablation.py --dataset glas
+* When the config has no ablation axis (no non-excluded list), the base config
+  is run in place; a single-row report is still produced under
+  ``outputs/reports/<dataset>/`` (no group folder).
 
-    # Generate + run from base config (e.g. CRAG — no pre-made ablation yamls)
-    python scripts/run_ablation.py --base-config configs/crag.yaml
+* ``--train_nums N`` repeats each config N times. Per repeat ``i`` the run's
+  artefacts are indexed so they don't overwrite each other: ``train_<i>.log``,
+  ``training_curves_<i>.png`` and ``..._<i>.pt`` checkpoints. Report metrics
+  (test_dice / test_iou / val_iou) are then aggregated as ``mean ± std`` over
+  the repeats, best_epoch as the rounded mean, plus a runs (ok/total) column.
 
-    # Subset of modes
-    python scripts/run_ablation.py --dataset glas --only weak_weak,diffrect
+Artefact layout (ablation)
+--------------------------
+Group folder name: ``<leaf1>__<leaf2>__<YYYYMMDD_HHMMSS>`` placed under each
+of the dataset folders::
 
-    # Training only, no full-image test eval
-    python scripts/run_ablation.py --dataset glas --skip-test
+    configs/<dataset>/<group>/<combo>.yaml
+    outputs/logs/<dataset>/<group>/<combo>/train_<i>.log
+    outputs/checkpoints/<dataset>/<group>/<combo>/..._<i>.pt
+    outputs/reports/<dataset>/<group>/ablation_report_<dataset>_<stamp>.{csv,png}
+
+where ``<combo>`` is e.g. ``use_text_encoder=true__use_ema_teacher=false``.
+
+Usage
+-----
+    python scripts/run_ablation.py --config configs/glas.yaml
+    python scripts/run_ablation.py --config configs/crag.yaml --skip-test
+    python scripts/run_ablation.py --config configs/glas.yaml --train_nums 5
 """
 from __future__ import annotations
 
 import argparse
 import copy
 import csv
+import itertools
+import os
 import re
+import signal
 import subprocess
 import sys
 from datetime import datetime
@@ -39,15 +60,76 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 
-ABLATION_MODES = ("strong_weak", "weak_weak", "strong_strong", "diffrect")
+# Lists that describe data, never an ablation axis (dotted paths).
+EXCLUDED_LIST_PATHS = {
+    "segmentation.aspp.rates",
+    "text.class_names",
+}
 
 
-def parse_run_metrics(log_path: Path) -> dict[str, str]:
-    metrics = {
-        "mDice": "N/A",
-        "mJaccard": "N/A",
-        "best_val_iou": "N/A",
-        "best_epoch": "N/A",
+# ---------------------------------------------------------------------------
+# Config tree helpers
+# ---------------------------------------------------------------------------
+def find_ablation_axes(cfg: dict) -> list[tuple[str, str, list]]:
+    """Walk the config tree and collect ablation axes.
+
+    Returns an ordered list of ``(dotted_path, leaf_key, values)`` for every
+    list-valued leaf that is not in EXCLUDED_LIST_PATHS.
+    """
+    axes: list[tuple[str, str, list]] = []
+
+    def _walk(node, prefix: str) -> None:
+        if not isinstance(node, dict):
+            return
+        for key, value in node.items():
+            dotted = f"{prefix}.{key}" if prefix else key
+            if isinstance(value, dict):
+                _walk(value, dotted)
+            elif isinstance(value, list):
+                if dotted in EXCLUDED_LIST_PATHS:
+                    continue
+                axes.append((dotted, key, list(value)))
+
+    _walk(cfg, "")
+    return axes
+
+
+def set_by_path(cfg: dict, dotted_path: str, value) -> None:
+    """Set a nested value addressed by a dotted path."""
+    keys = dotted_path.split(".")
+    node = cfg
+    for key in keys[:-1]:
+        node = node[key]
+    node[keys[-1]] = value
+
+
+def value_tag(value) -> str:
+    """Filesystem-safe label for one value."""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    return str(value)
+
+
+def combo_filename(axes: list[tuple[str, str, list]], combo: tuple) -> str:
+    """e.g. use_text_encoder=true__use_ema_teacher=false"""
+    return "__".join(
+        f"{leaf}={value_tag(val)}"
+        for (_, leaf, _), val in zip(axes, combo)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Log parsing
+# ---------------------------------------------------------------------------
+def parse_run_metrics(log_path: Path) -> dict:
+    """Parse one run's train.log. Values are floats (epoch int) or None."""
+    metrics: dict = {
+        "test_dice": None,
+        "test_iou": None,
+        "best_val_iou": None,
+        "best_epoch": None,
     }
     if not log_path.exists():
         return metrics
@@ -75,37 +157,78 @@ def parse_run_metrics(log_path: Path) -> dict[str, str]:
 
             m_test = test_line_re.search(line)
             if m_test:
-                metrics["mDice"] = f"{float(m_test.group(1)):.4f}"
-                metrics["mJaccard"] = f"{float(m_test.group(2)):.4f}"
+                metrics["test_dice"] = float(m_test.group(1))
+                metrics["test_iou"] = float(m_test.group(2))
 
             m_val = best_val_re.search(line)
             if m_val:
-                metrics["best_val_iou"] = f"{float(m_val.group(1)):.4f}"
+                metrics["best_val_iou"] = float(m_val.group(1))
 
-    if best_epoch is not None:
-        metrics["best_epoch"] = str(best_epoch)
+    metrics["best_epoch"] = best_epoch
     return metrics
 
 
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+METRIC_COLS = [
+    ("test_dice", "best test_dice"),
+    ("test_iou", "best test_iou"),
+    ("best_val_iou", "best val_iou"),
+    ("best_epoch", "best epoch"),
+    ("runs", "runs (ok/total)"),
+    ("config", "configs_path"),
+]
+
+
+def _fmt_mean_std(values, decimals: int = 4) -> str:
+    """mean ± std over non-None values (sample std; 0 when a single value)."""
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return "N/A"
+    mean = sum(vals) / len(vals)
+    if len(vals) > 1:
+        std = (sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)) ** 0.5
+    else:
+        std = 0.0
+    return f"{mean:.{decimals}f} ± {std:.{decimals}f}"
+
+
+def _fmt_epoch_mean(values) -> str:
+    """Mean best-epoch rounded to the unit place over non-None values."""
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return "N/A"
+    return str(round(sum(vals) / len(vals)))
+
+
+def aggregate_metrics(per_run: list[dict], statuses: list[bool], rel_cfg: str) -> dict:
+    """Collapse the N repeats of one config into a single report row."""
+    return {
+        "test_dice": _fmt_mean_std([m["test_dice"] for m in per_run]),
+        "test_iou": _fmt_mean_std([m["test_iou"] for m in per_run]),
+        "best_val_iou": _fmt_mean_std([m["best_val_iou"] for m in per_run]),
+        "best_epoch": _fmt_epoch_mean([m["best_epoch"] for m in per_run]),
+        "runs": f"{sum(1 for s in statuses if s)}/{len(statuses)}",
+        "config": rel_cfg,
+    }
+
+
 def write_ablation_report(
-    dataset: str, rows: list[dict[str, str]], out_dir: Path
+    dataset: str,
+    axis_leaves: list[str],
+    rows: list[dict[str, str]],
+    out_dir: Path,
+    name_prefix: str = "ablation_report",
 ) -> tuple[Path, Path | None]:
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_path = out_dir / f"ablation_report_{dataset}_{stamp}.csv"
-    png_path = out_dir / f"ablation_report_{dataset}_{stamp}.png"
+    csv_path = out_dir / f"{name_prefix}_{dataset}_{stamp}.csv"
+    png_path = out_dir / f"{name_prefix}_{dataset}_{stamp}.png"
 
-    headers = [
-        "mode",
-        "teacher",
-        "mDice",
-        "mJaccard",
-        "best_val_iou",
-        "best_epoch",
-        "status",
-        "elapsed",
-        "config",
-    ]
+    headers = list(axis_leaves) + [key for key, _ in METRIC_COLS]
+    col_labels = list(axis_leaves) + [label for _, label in METRIC_COLS]
+
     with open(csv_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=headers)
         writer.writeheader()
@@ -116,163 +239,142 @@ def write_ablation_report(
     except Exception:
         return csv_path, None
 
-    figure_height = max(2.8, 1.0 + 0.5 * (len(rows) + 1))
-    fig, ax = plt.subplots(figsize=(14.0, figure_height))
+    cell_text = [[str(row.get(k, "")) for k in headers] for row in rows]
+
+    # Width: give configs_path room. Roughly scale by the longest path string.
+    max_cfg_len = max(
+        [len("configs_path")] + [len(str(row.get("config", ""))) for row in rows]
+    )
+    fig_width = max(14.0, 6.0 + 0.10 * max_cfg_len + 1.2 * len(axis_leaves))
+    fig_height = max(2.8, 1.0 + 0.5 * (len(rows) + 1))
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     ax.axis("off")
-    col_labels = [
-        "mode",
-        "teacher",
-        "mDice",
-        "mJaccard",
-        "best val iou",
-        "best epoch",
-        "status",
-        "elapsed",
-        "config",
-    ]
-    cell_text = [[row[k] for k in headers] for row in rows]
     table = ax.table(
         cellText=cell_text, colLabels=col_labels, cellLoc="center", loc="center"
     )
     table.auto_set_font_size(False)
     table.set_fontsize(9)
-    table.scale(1.0, 1.25)
+    table.auto_set_column_width(col=list(range(len(headers))))
+    table.scale(1.0, 1.3)
     plt.tight_layout()
     plt.savefig(png_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
     return csv_path, png_path
 
 
-def discover_ablation_configs(dataset: str, ablations_dir: Path) -> dict[str, Path]:
-    """Return {mode: yaml_path} for pre-made configs like glas_strong_weak.yaml."""
-    found: dict[str, Path] = {}
-    for mode in ABLATION_MODES:
-        path = ablations_dir / f"{dataset}_{mode}.yaml"
-        if path.is_file():
-            found[mode] = path
-    return found
+# ---------------------------------------------------------------------------
+# Training launch
+# ---------------------------------------------------------------------------
+def _terminate_process_group(proc: "subprocess.Popen") -> None:
+    """Tear down the child's whole process group so no GPU process is orphaned.
 
-
-def build_ablation_config(
-    base_cfg: dict,
-    mode: str,
-    use_ema_teacher: bool = True,
-    ema_alpha: float = 0.999,
-) -> dict:
-    cfg = copy.deepcopy(base_cfg)
-    dataset = str(cfg.get("dataset", "run"))
-    base_log = cfg["paths"]["log_dir"].rstrip("/")
-    base_ckpt = cfg["paths"]["checkpoint_dir"].rstrip("/")
-    teacher_tag = "ema" if use_ema_teacher else "no_ema"
-    exp_name = f"ablation_{mode}_{teacher_tag}"
-
-    cfg["train"]["use_diffusion"] = True
-    cfg["train"]["pseudo_ablation"] = mode
-    cfg["train"]["use_ema_teacher"] = use_ema_teacher
-    cfg["train"]["ema_alpha"] = ema_alpha
-    cfg["paths"]["log_dir"] = f"{base_log}/{exp_name}"
-    cfg["paths"]["checkpoint_dir"] = f"{base_ckpt}/{exp_name}"
-    return cfg
-
-
-def resolve_run_configs(
-    dataset: str | None,
-    base_config: Path | None,
-    modes: list[str],
-    ablations_dir: Path,
-    write_dir: Path,
-    use_ema_teacher: bool = True,
-    ema_alpha: float = 0.999,
-) -> list[tuple[str, Path]]:
-    """Return ordered list of (mode, config_path) to pass to train.py.
-
-    Resolution order:
-      1. Explicit --base-config path  → use directly
-      2. configs/{dataset}.yaml found → copy + patch (preferred)
-      3. Pre-made configs/ablations/{dataset}_{mode}.yaml → copy + patch (fallback)
-
-    In all cases only the ablation-specific keys are overridden:
-      use_diffusion, pseudo_ablation, use_ema_teacher, ema_alpha, output paths.
-    All other settings (lr, epochs, freeze_enc, …) come unchanged from the source.
+    Escalates SIGINT -> SIGTERM -> SIGKILL. Killing the process *group* ensures
+    DataLoader workers (and any other children of train.py) are released too,
+    freeing the GPU memory they hold.
     """
-    if dataset is None and base_config is None:
-        raise ValueError("Provide --dataset or --base-config")
+    if proc.poll() is not None:
+        return
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=10)
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
-    write_dir.mkdir(parents=True, exist_ok=True)
-    teacher_tag = "ema" if use_ema_teacher else "no_ema"
-    runs: list[tuple[str, Path]] = []
 
-    # --- Resolve source config -----------------------------------------------
-    if base_config is not None:
-        source_path = base_config
-    else:
-        # Try the main config first: configs/{dataset}.yaml
-        candidate = ROOT / "configs" / f"{dataset}.yaml"
-        if candidate.is_file():
-            source_path = candidate
-        else:
-            source_path = None   # fall back to pre-made ablation configs
+def run_training(config_rel: str, device: str, skip_test: bool) -> tuple[int, str]:
+    cmd = [
+        sys.executable,
+        str(ROOT / "scripts" / "train.py"),
+        "--config",
+        config_rel,
+        "--device",
+        device,
+    ]
+    if skip_test:
+        cmd.append("--skip-test")
 
-    # --- Generate one config per mode from a single source -------------------
-    if source_path is not None:
-        with open(source_path) as fh:
-            base_cfg = yaml.safe_load(fh)
-        ds = dataset or str(base_cfg.get("dataset", source_path.stem))
-        for mode in modes:
-            cfg = build_ablation_config(base_cfg, mode, use_ema_teacher, ema_alpha)
-            out_path = write_dir / f"_{ds}_ablation_{mode}_{teacher_tag}.yaml"
-            with open(out_path, "w") as fh:
-                yaml.dump(cfg, fh, default_flow_style=False,
-                          allow_unicode=True, sort_keys=False)
-            runs.append((mode, out_path))
-        return runs
+    t0 = datetime.now()
+    # start_new_session=True puts the child in its own process group, so a
+    # terminal Ctrl+C only interrupts this runner; we then forward the signal
+    # to the whole child group and wait for the GPU memory to be released.
+    proc = subprocess.Popen(cmd, cwd=str(ROOT), start_new_session=True)
+    try:
+        returncode = proc.wait()
+    except KeyboardInterrupt:
+        print("\nCtrl+C — terminating training and releasing GPU memory...")
+        _terminate_process_group(proc)
+        raise
+    elapsed = str(datetime.now() - t0).split(".")[0]
+    return returncode, elapsed
 
-    # --- Fallback: pre-made ablation configs ---------------------------------
-    pre_made = discover_ablation_configs(dataset, ablations_dir)
-    missing = [m for m in modes if m not in pre_made]
-    if missing:
-        raise FileNotFoundError(
-            f"No configs/{dataset}.yaml found and no pre-made ablation configs for "
-            f"{dataset}: {missing}. Create configs/{dataset}.yaml or add "
-            f"configs/ablations/{{dataset}}_{{mode}}.yaml files."
-        )
 
-    for mode in modes:
-        # Read the pre-made config, patch only ablation-specific keys, write a copy.
-        with open(pre_made[mode]) as fh:
-            cfg = yaml.safe_load(fh)
-        cfg["train"]["use_ema_teacher"] = use_ema_teacher
-        cfg["train"]["ema_alpha"] = ema_alpha
-        for path_key in ("log_dir", "checkpoint_dir"):
-            base_p = cfg["paths"][path_key].rstrip("/")
-            cfg["paths"][path_key] = f"{base_p}_{teacher_tag}"
-        out_path = write_dir / f"_{dataset}_{mode}_{teacher_tag}.yaml"
-        with open(out_path, "w") as fh:
-            yaml.dump(cfg, fh, default_flow_style=False,
-                      allow_unicode=True, sort_keys=False)
-        runs.append((mode, out_path))
+def _finalize_run_artifacts(
+    log_dir: Path, ckpt_dir: Path, dataset: str, index: int
+) -> Path:
+    """Rename train.log, training_curves.png and best checkpoints to carry the
+    run index, so repeats of the same config don't overwrite each other.
 
-    return runs
+    Returns the indexed log path (for metric parsing).
+    """
+    log_src = log_dir / "train.log"
+    log_dst = log_dir / f"train_{index}.log"
+    if log_src.exists():
+        log_src.replace(log_dst)
+    curve_src = log_dir / "training_curves.png"
+    if curve_src.exists():
+        curve_src.replace(log_dir / f"training_curves_{index}.png")
+    for name in (f"seg_{dataset}_uni_conch_best.pt", "diffusion_best.pt"):
+        src = ckpt_dir / name
+        if src.exists():
+            src.replace(ckpt_dir / f"{src.stem}_{index}{src.suffix}")
+    return log_dst
+
+
+def run_config_n_times(
+    rel_cfg: str,
+    cfg: dict,
+    dataset: str,
+    train_nums: int,
+    device: str,
+    skip_test: bool,
+) -> tuple[list[dict], list[bool]]:
+    """Run one config `train_nums` times, indexing artefacts per repeat.
+
+    Returns (per_run_metrics, statuses).
+    """
+    log_dir = ROOT / cfg["paths"]["log_dir"]
+    ckpt_dir = ROOT / cfg["paths"]["checkpoint_dir"]
+    per_run: list[dict] = []
+    statuses: list[bool] = []
+    for i in range(train_nums):
+        print(f"   run {i + 1}/{train_nums} (index {i}) ...")
+        returncode, elapsed = run_training(rel_cfg, device, skip_test)
+        log_dst = _finalize_run_artifacts(log_dir, ckpt_dir, dataset, i)
+        per_run.append(parse_run_metrics(log_dst))
+        statuses.append(returncode == 0)
+        status = "OK" if returncode == 0 else f"FAILED (exit {returncode})"
+        print(f"     -> {status}  (wall {elapsed})")
+    return per_run, statuses
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run pseudo-label ablation experiments (4 modes, separate from run_sweep.py)"
+        description="Generic ablation runner driven by list-valued config fields."
     )
     parser.add_argument(
-        "--dataset",
-        default=None,
-        help="Dataset name prefix for configs/ablations/{dataset}_{mode}.yaml (e.g. glas)",
-    )
-    parser.add_argument(
-        "--base-config",
-        default=None,
-        help="Base YAML; generates per-mode configs under configs/ablations/_generated/",
-    )
-    parser.add_argument(
-        "--only",
-        default=None,
-        help="Comma-separated subset of modes (default: all four)",
+        "--config",
+        required=True,
+        help="Base YAML config (e.g. configs/glas.yaml or configs/crag.yaml)",
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
@@ -281,132 +383,127 @@ def main() -> None:
         help="Skip full-image test evaluation after each run",
     )
     parser.add_argument(
-        "--ablations-dir",
-        default="configs/ablations",
-        help="Directory with pre-made ablation YAML files",
-    )
-    # --- EMA teacher ---
-    teacher_grp = parser.add_mutually_exclusive_group()
-    teacher_grp.add_argument(
-        "--use-teacher",
-        dest="use_ema_teacher",
-        action="store_true",
-        default=True,
-        help="Enable EMA teacher for pseudo-label generation (default: on)",
-    )
-    teacher_grp.add_argument(
-        "--no-teacher",
-        dest="use_ema_teacher",
-        action="store_false",
-        help="Disable EMA teacher; use current student model for pseudo-labels",
-    )
-    parser.add_argument(
-        "--ema-alpha",
-        type=float,
-        default=0.999,
-        metavar="ALPHA",
-        help="EMA decay (default: 0.999). Higher = slower teacher update.",
+        "--train_nums",
+        type=int,
+        default=1,
+        help="How many times to train each config (repeats; default 1). "
+        "Report metrics are aggregated as mean ± std over the repeats.",
     )
     args = parser.parse_args()
 
-    if args.dataset is None and args.base_config is None:
-        args.dataset = "glas"
+    config_arg = Path(args.config)
+    base_cfg_path = config_arg if config_arg.is_absolute() else ROOT / config_arg
+    if not base_cfg_path.is_file():
+        parser.error(f"Config not found: {base_cfg_path}")
 
-    modes = list(ABLATION_MODES)
-    if args.only:
-        modes = [m.strip() for m in args.only.split(",") if m.strip()]
-        bad = [m for m in modes if m not in ABLATION_MODES]
-        if bad:
-            parser.error(f"Unknown mode(s): {bad}. Choose from {ABLATION_MODES}")
+    with open(base_cfg_path) as fh:
+        base_cfg = yaml.safe_load(fh)
 
-    ablations_dir = ROOT / args.ablations_dir
-    base_config = ROOT / args.base_config if args.base_config else None
-    write_dir = ablations_dir / "_generated"
+    dataset = str(base_cfg.get("dataset", base_cfg_path.stem))
+    axes = find_ablation_axes(base_cfg)
+    train_nums = max(1, int(args.train_nums))
 
-    runs = resolve_run_configs(
-        dataset=args.dataset,
-        base_config=base_config,
-        modes=modes,
-        ablations_dir=ablations_dir,
-        write_dir=write_dir,
-        use_ema_teacher=args.use_ema_teacher,
-        ema_alpha=args.ema_alpha,
-    )
+    # --- No ablation axis: run base config in place N times, single-row report
+    if not axes:
+        rel_cfg = (
+            str(base_cfg_path.relative_to(ROOT))
+            if base_cfg_path.is_relative_to(ROOT)
+            else str(base_cfg_path)
+        )
+        print(f"Dataset    : {dataset}")
+        print("Ablation   : none (no list-valued fields) — single config")
+        print(f"Repeats    : {train_nums}")
+        print(f"Config     : {rel_cfg}")
+        print()
 
-    dataset_label = args.dataset
-    if dataset_label is None and base_config is not None:
-        with open(base_config) as fh:
-            dataset_label = str(yaml.safe_load(fh).get("dataset", base_config.stem))
+        per_run, statuses = run_config_n_times(
+            rel_cfg, base_cfg, dataset, train_nums, args.device, args.skip_test
+        )
+        row = aggregate_metrics(per_run, statuses, rel_cfg)
 
-    teacher_label = f"EMA teacher ON  (alpha={args.ema_alpha})" if args.use_ema_teacher else "EMA teacher OFF"
-    total = len(runs)
-    print(f"Dataset    : {dataset_label}")
-    print(f"Teacher    : {teacher_label}")
-    print(f"Ablation   : {total} run(s) — {', '.join(m for m, _ in runs)}")
-    print(f"Configs    : generated in {write_dir}")
+        report_dir = ROOT / "outputs" / "reports" / dataset
+        csv_path, png_path = write_ablation_report(
+            dataset, [], [row], report_dir, name_prefix="report"
+        )
+        print(f"\nReport CSV : {csv_path}")
+        if png_path is not None:
+            print(f"Report PNG : {png_path}")
+        else:
+            print("Report PNG : skipped (matplotlib not available)")
+        n_ok = sum(1 for s in statuses if s)
+        sys.exit(0 if n_ok == len(statuses) else 1)
+
+    # --- Ablation: Cartesian product over all list axes ----------------------
+    axis_leaves = [leaf for _, leaf, _ in axes]
+    combos = list(itertools.product(*[values for _, _, values in axes]))
+    total = len(combos)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    group = "__".join(axis_leaves) + f"__{stamp}"
+
+    configs_dir = ROOT / "configs" / dataset / group
+    configs_dir.mkdir(parents=True, exist_ok=True)
+
+    base_log = base_cfg["paths"]["log_dir"].rstrip("/")
+    base_ckpt = base_cfg["paths"]["checkpoint_dir"].rstrip("/")
+
+    print(f"Dataset    : {dataset}")
+    print(f"Ablation   : {total} config(s) over axes {axis_leaves}")
+    print(f"Repeats    : {train_nums} per config ({total * train_nums} runs total)")
+    print(f"Group      : {group}")
+    print(f"Configs    : {configs_dir.relative_to(ROOT)}")
     print()
 
-    results: list[tuple[str, str, str]] = []
+    results: list[tuple[str, str]] = []   # (combo_name, runs_ok/total)
     report_rows: list[dict[str, str]] = []
 
-    for idx, (mode, cfg_path) in enumerate(runs, start=1):
-        rel_cfg = cfg_path.relative_to(ROOT)
-        teacher_str = f"EMA(α={args.ema_alpha})" if args.use_ema_teacher else "none"
+    for idx, combo in enumerate(combos, start=1):
+        combo_name = combo_filename(axes, combo)
+
+        cfg = copy.deepcopy(base_cfg)
+        for (dotted, _, _), val in zip(axes, combo):
+            set_by_path(cfg, dotted, val)
+        cfg["paths"]["log_dir"] = f"{base_log}/{group}/{combo_name}"
+        cfg["paths"]["checkpoint_dir"] = f"{base_ckpt}/{group}/{combo_name}"
+
+        cfg_path = configs_dir / f"{combo_name}.yaml"
+        with open(cfg_path, "w") as fh:
+            yaml.dump(
+                cfg, fh, default_flow_style=False, allow_unicode=True, sort_keys=False
+            )
+        rel_cfg = str(cfg_path.relative_to(ROOT))
+
         print(f"{'=' * 72}")
-        print(f"[{idx:>2}/{total}]  pseudo_ablation={mode}  teacher={teacher_str}")
+        print(f"[{idx:>2}/{total}]  {combo_name}   (x{train_nums})")
         print(f"         config={rel_cfg}")
         print(f"{'=' * 72}")
 
-        cmd = [
-            sys.executable,
-            str(ROOT / "scripts" / "train.py"),
-            "--config",
-            str(rel_cfg),
-            "--device",
-            args.device,
-        ]
-        if args.skip_test:
-            cmd.append("--skip-test")
-
-        t0 = datetime.now()
-        ret = subprocess.run(cmd, cwd=str(ROOT))
-        elapsed = str(datetime.now() - t0).split(".")[0]
-
-        status = "OK" if ret.returncode == 0 else f"FAILED (exit {ret.returncode})"
-        results.append((mode, status, elapsed))
-
-        with open(cfg_path) as fh:
-            run_cfg = yaml.safe_load(fh)
-        run_log_path = ROOT / run_cfg["paths"]["log_dir"] / "train.log"
-        metrics = parse_run_metrics(run_log_path)
-        report_rows.append(
-            {
-                "mode": mode,
-                "teacher": f"EMA(α={args.ema_alpha})" if args.use_ema_teacher else "none",
-                "mDice": metrics["mDice"],
-                "mJaccard": metrics["mJaccard"],
-                "best_val_iou": metrics["best_val_iou"],
-                "best_epoch": metrics["best_epoch"],
-                "status": status,
-                "elapsed": elapsed,
-                "config": str(rel_cfg),
-            }
+        per_run, statuses = run_config_n_times(
+            rel_cfg, cfg, dataset, train_nums, args.device, args.skip_test
         )
 
-        print(f"\n  → {status}  (wall time {elapsed})\n")
+        row: dict[str, str] = {}
+        for (_, leaf, _), val in zip(axes, combo):
+            row[leaf] = value_tag(val)
+        row.update(aggregate_metrics(per_run, statuses, rel_cfg))
+        report_rows.append(row)
+        results.append((combo_name, row["runs"]))
+
+        print(f"\n  → repeats OK: {row['runs']}\n")
 
     print(f"\n{'=' * 72}")
-    print(f"ABLATION COMPLETE [{str(dataset_label).upper()}] — SUMMARY")
+    print(f"ABLATION COMPLETE [{dataset.upper()}] — SUMMARY")
     print(f"{'=' * 72}")
     pad = max(len(r[0]) for r in results)
-    for mode, status, elapsed in results:
-        marker = "✓" if status == "OK" else "✗"
-        print(f"  {marker}  {mode:<{pad}}  {elapsed:>8}  {status}")
+    for combo_name, runs_str in results:
+        ok, tot = runs_str.split("/")
+        marker = "✓" if ok == tot else "✗"
+        print(f"  {marker}  {combo_name:<{pad}}  repeats OK: {runs_str}")
     print()
 
-    report_dir = ROOT / "outputs" / "reports" / str(dataset_label)
+    report_dir = ROOT / "outputs" / "reports" / dataset / group
     csv_path, png_path = write_ablation_report(
-        str(dataset_label), report_rows, report_dir
+        dataset, axis_leaves, report_rows, report_dir
     )
     print(f"Report CSV : {csv_path}")
     if png_path is not None:
@@ -415,13 +512,17 @@ def main() -> None:
         print("Report PNG : skipped (matplotlib not available)")
     print()
 
-    failed = [r for r in results if r[1] != "OK"]
+    failed = [(c, r) for c, r in results if r.split("/")[0] != r.split("/")[1]]
     if failed:
-        print(f"{len(failed)} run(s) FAILED:")
-        for mode, status, _ in failed:
-            print(f"    {mode}  →  {status}")
+        print(f"{len(failed)} config(s) had FAILED repeats:")
+        for combo_name, runs_str in failed:
+            print(f"    {combo_name}  →  repeats OK: {runs_str}")
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nAblation cancelled by user (Ctrl+C). Remaining runs skipped.")
+        sys.exit(130)

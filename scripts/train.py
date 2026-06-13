@@ -95,12 +95,30 @@ def main():
             log.warning("No %s at %s; skip test evaluation.", ckpt_name, ckpt)
 
 
+def _release_gpu() -> None:
+    """Free GPU memory and tear down DataLoader workers on shutdown."""
+    try:
+        import gc
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        logging.getLogger(__name__).warning("Stopped by KeyboardInterrupt (Ctrl+C).")
-        raise
+        logging.getLogger(__name__).warning(
+            "Stopped by KeyboardInterrupt (Ctrl+C) — releasing GPU memory."
+        )
+        _release_gpu()
+        # Exit immediately so lingering DataLoader workers don't keep the GPU busy.
+        os._exit(130)
     except Exception:
         logging.getLogger(__name__).exception("Training crashed with an exception.")
+        _release_gpu()
         raise

@@ -21,6 +21,7 @@ from evaluation.metrics import evaluate
 from losses.segmentation_loss import (
     SegmentationLoss,
     compute_masked_pseudo_loss,
+    soft_consistency_loss,
     view_consistency_loss,
 )
 from models.diffusion import DiffusionScheduler, MiniUNet
@@ -43,18 +44,32 @@ def _ema_update(ema_model: torch.nn.Module, student: torch.nn.Module, alpha: flo
         b_ema.copy_(b_s)
 
 
-def get_confidence_threshold(epoch: int) -> float:
-    if epoch < 10:
-        return 0.90
-    if epoch < 15:
-        return 0.87
-    if epoch < 20:
-        return 0.83
-    if epoch < 25:
-        return 0.80
-    if epoch < 32:
-        return 0.75
-    return 0.70
+def get_conf_schedule(
+    epoch: int,
+    epochs: int,
+    warmup_epochs: int,
+    is_warmup: bool,
+    conf_strict_epochs: int,
+    keep_frac_min: float,
+    keep_frac_max: float,
+) -> Tuple[bool, float]:
+    """Hybrid FixMatch-style confidence curriculum (strict early, then relax).
+
+    Returns ``(strict, keep_frac)``:
+      * strict=True  → for the first ``conf_strict_epochs`` semi-sup epochs the
+        caller uses a fixed strict threshold (tau_max).
+      * strict=False → percentile phase; ``keep_frac`` ramps linearly from
+        ``keep_frac_min`` to ``keep_frac_max`` over the remaining semi-sup
+        epochs (keep a growing fraction of the most confident pixels).
+    """
+    e0 = (warmup_epochs if is_warmup else 0) + 1   # first semi-sup epoch
+    semi = epoch - e0                              # 0 on the first semi-sup epoch
+    if semi < conf_strict_epochs:
+        return True, keep_frac_min
+    total = max(1, epochs - e0 - conf_strict_epochs)
+    p2 = min(max((semi - conf_strict_epochs) / total, 0.0), 1.0)
+    keep_frac = keep_frac_min + (keep_frac_max - keep_frac_min) * p2
+    return False, keep_frac
 
 def get_pseudo_weight(
     epoch: int,
@@ -89,7 +104,91 @@ def resolve_pseudo_ablation(cfg: Dict[str, Any]) -> str:
     return mode
 
 
-@torch.no_grad()
+CONSISTENCY_TYPES = ("traditional", "soft", "combined")
+
+
+def resolve_consistency_type(cfg: Dict[str, Any]) -> str:
+    """Which consistency loss to use for the unsupervised terms.
+
+    Applies to BOTH ``loss_refined_unsup`` (pseudo-label loss) and
+    ``loss_view_unsup`` (cross-view consistency):
+      traditional – BCE + Dice (hard pseudo-label / view consistency; current).
+      soft        – CorrMatch-style KL soft supervision on the soft teacher
+                    distribution (no hard thresholding of the target).
+      combined    – traditional + ``lambda_soft`` * soft.
+    """
+    mode = str(cfg.get("loss", {}).get("consistency_type", "traditional")).lower()
+    if mode not in CONSISTENCY_TYPES:
+        raise ValueError(
+            f"loss.consistency_type must be one of {CONSISTENCY_TYPES}, got {mode!r}"
+        )
+    return mode
+
+
+def _combine_consistency(
+    trad: Optional[torch.Tensor],
+    soft: Optional[torch.Tensor],
+    lambda_soft: float,
+) -> Optional[torch.Tensor]:
+    """None-safe combination of the traditional and soft consistency terms.
+
+    The non-None terms decide the effective mode:
+      * only ``trad``        → traditional
+      * only ``soft``        → soft (full weight; the caller's pseudo/view
+                                weight still scales it)
+      * both                 → combined: trad + lambda_soft * soft
+    """
+    if trad is None and soft is None:
+        return None
+    if soft is None:
+        return trad
+    if trad is None:
+        return soft
+    return (1 - lambda_soft) * trad + lambda_soft * soft
+
+
+def refined_consistency_loss(
+    logits: torch.Tensor,
+    hard_pseudo: torch.Tensor,
+    soft_pseudo: torch.Tensor,
+    valid_mask: torch.Tensor,
+    consistency_type: str,
+    lambda_soft: float,
+) -> Optional[torch.Tensor]:
+    """Pseudo-label (refined) loss under the selected consistency type.
+
+    traditional → masked BCE+Dice against the hard (0/1) pseudo-label.
+    soft        → masked KL against the soft (refined) teacher distribution.
+    combined    → both.
+    """
+    trad = soft = None
+    if consistency_type in ("traditional", "combined"):
+        trad = compute_masked_pseudo_loss(logits, hard_pseudo, valid_mask)
+    if consistency_type in ("soft", "combined"):
+        soft = soft_consistency_loss(logits, soft_pseudo, valid_mask)
+    return _combine_consistency(trad, soft, lambda_soft)
+
+
+def view_consistency_combined(
+    logits_weak: torch.Tensor,
+    logits_strong: torch.Tensor,
+    consistency_type: str,
+    lambda_soft: float,
+) -> Optional[torch.Tensor]:
+    """Cross-view consistency loss under the selected consistency type.
+
+    traditional → BCE+Dice between the two views.
+    soft        → KL matching the strong view to the (detached) weak view.
+    combined    → both.
+    """
+    trad = soft = None
+    if consistency_type in ("traditional", "combined"):
+        trad = view_consistency_loss(logits_weak, logits_strong)
+    if consistency_type in ("soft", "combined"):
+        soft = soft_consistency_loss(logits_strong, torch.sigmoid(logits_weak))
+    return _combine_consistency(trad, soft, lambda_soft)
+
+
 def compute_diffusion_unsup_losses(
     seg_model: torch.nn.Module,
     diff_model: torch.nn.Module,
@@ -100,10 +199,15 @@ def compute_diffusion_unsup_losses(
     device: torch.device,
     get_text_emb: Callable[[int], torch.Tensor],
     noise_frac: float,
-    conf_thresh: float,
+    strict: bool,
+    keep_frac: float,
+    tau_min: float,
+    tau_max: float,
     pseudo_ablation: str,
+    consistency_type: str = "traditional",
+    lambda_soft: float = 0.25,
     teacher_model: Optional[torch.nn.Module] = None,
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], float, bool]:
+):
     """Diffusion-refined pseudo-label ablations for unlabeled loss.
 
     Modes (train.pseudo_ablation):
@@ -112,57 +216,100 @@ def compute_diffusion_unsup_losses(
       strong_strong – self-training: strong logits vs refined strong mask
       diffrect     – weak_weak + strong_weak (both vs refined weak mask)
 
+    consistency_type selects how both ``loss_refined_unsup`` and
+    ``loss_view_unsup`` are computed: traditional (BCE+Dice), soft (CorrMatch
+    KL on the soft teacher distribution), or combined (trad + lambda_soft*soft).
+
     teacher_model: if provided (EMA model), pseudo-labels are generated from the
     stable teacher instead of the current student. Student predictions
     (logits_ua, logits_ub) always come from seg_model.
-    """
-    refine_weak = pseudo_ablation in ("strong_weak", "weak_weak", "diffrect")
-    refine_img = img_ua if refine_weak else img_ub
-    pseudo_source = teacher_model if teacher_model is not None else seg_model
 
-    refined_pseudo, conf_map = generate_and_refine_pseudo_batch(
-        pseudo_source,
-        diff_model,
-        diff_sched,
-        refine_img,
-        device,
-        get_text_emb,
-        noise_frac,
-    )
-    valid_mask = (conf_map > conf_thresh).float()
-    valid_px_ratio = valid_mask.mean().item()
+    NOTE: pseudo-label generation and the confidence-mask computation run under
+    ``torch.no_grad`` (they must not receive gradients), but the student forward
+    passes and the returned losses DO build a graph so the unsupervised loss
+    actually trains the model.
+    """
+    # ---- Pseudo-label target + confidence mask (no gradients) --------------
+    with torch.no_grad():
+        refine_weak = pseudo_ablation in ("strong_weak", "weak_weak", "diffrect")
+        refine_img = img_ua if refine_weak else img_ub
+        pseudo_source = teacher_model if teacher_model is not None else seg_model
+
+        refined_pseudo, conf_map = generate_and_refine_pseudo_batch(
+            pseudo_source,
+            diff_model,
+            diff_sched,
+            refine_img,
+            device,
+            get_text_emb,
+            noise_frac,
+        )
+        # Per-image confidence threshold (hybrid curriculum):
+        #   strict phase     → fixed tau_max
+        #   percentile phase → keep the top `keep_frac` most-confident pixels of
+        #                      each image, clamped to [tau_min, tau_max].
+        b = conf_map.shape[0]
+        if strict:
+            thr = torch.full((b,), tau_max, device=conf_map.device, dtype=torch.float32)
+        else:
+            flat = conf_map.reshape(b, -1).float()
+            q = min(max(1.0 - keep_frac, 0.0), 1.0)
+            thr = torch.quantile(flat, q, dim=1).clamp(tau_min, tau_max)
+        valid_mask = (conf_map > thr.view(b, 1, 1, 1)).float()
+        valid_px_ratio = valid_mask.mean().item()
+        conf_thresh_eff = float(thr.mean().item())
+        # Hard (0/1) target for traditional supervision; the soft target is the
+        # raw refined probability map used by CorrMatch-style soft supervision.
+        hard_pseudo = (refined_pseudo > 0.5).float()
+        soft_pseudo = refined_pseudo
 
     if valid_mask.sum() == 0:
-        return None, None, valid_px_ratio, True
+        if pseudo_ablation == "diffrect":
+            return None, (None, None), None, valid_px_ratio, conf_thresh_eff, True
+        return None, None, valid_px_ratio, conf_thresh_eff, True
 
-    hard_pseudo = (refined_pseudo > 0.5).float()
+    # ---- Student forward + unsupervised losses (with gradients) ------------
     logits_ua, _ = seg_model(img_ua, txt_u)
     logits_ub, _ = seg_model(img_ub, txt_u)
 
     if pseudo_ablation == "strong_weak":
-        l_unsup = compute_masked_pseudo_loss(logits_ub, hard_pseudo, valid_mask)
+        loss_refined_unsup = refined_consistency_loss(
+            logits_ub, hard_pseudo, soft_pseudo, valid_mask, consistency_type, lambda_soft
+        )
     elif pseudo_ablation == "weak_weak":
-        l_unsup = compute_masked_pseudo_loss(logits_ua, hard_pseudo, valid_mask)
+        loss_refined_unsup = refined_consistency_loss(
+            logits_ua, hard_pseudo, soft_pseudo, valid_mask, consistency_type, lambda_soft
+        )
     elif pseudo_ablation == "strong_strong":
-        l_unsup = compute_masked_pseudo_loss(logits_ub, hard_pseudo, valid_mask)
+        loss_refined_unsup = refined_consistency_loss(
+            logits_ub, hard_pseudo, soft_pseudo, valid_mask, consistency_type, lambda_soft
+        )
     elif pseudo_ablation == "diffrect":
-        l_rect = compute_masked_pseudo_loss(logits_ua, hard_pseudo, valid_mask)
-        l_fix = compute_masked_pseudo_loss(logits_ub, hard_pseudo, valid_mask)
+        l_rect = refined_consistency_loss(
+            logits_ua, hard_pseudo, soft_pseudo, valid_mask, consistency_type, lambda_soft
+        )
+        l_fix = refined_consistency_loss(
+            logits_ub, hard_pseudo, soft_pseudo, valid_mask, consistency_type, lambda_soft
+        )
         if l_rect is None and l_fix is None:
-            l_unsup = None
+            loss_refined_unsup = None
         elif l_rect is None:
-            l_unsup = l_fix
+            loss_refined_unsup = l_fix
         elif l_fix is None:
-            l_unsup = l_rect
+            loss_refined_unsup = l_rect
         else:
-            l_unsup = (l_rect + l_fix) / 2
+            loss_refined_unsup = 0.5 * l_rect + 0.5 * l_fix
     else:
         raise ValueError(f"Unknown pseudo_ablation: {pseudo_ablation}")
 
-    l_view_unsup = (
-        view_consistency_loss(logits_ua, logits_ub) if l_unsup is not None else None
+    loss_view_unsup = view_consistency_combined(
+        logits_ua, logits_ub, consistency_type, lambda_soft
     )
-    return l_unsup, l_view_unsup, valid_px_ratio, l_unsup is None
+
+    if pseudo_ablation == "diffrect":
+        return loss_refined_unsup, (l_rect, l_fix), loss_view_unsup, valid_px_ratio, conf_thresh_eff, loss_refined_unsup is None
+    else:
+        return loss_refined_unsup, loss_view_unsup, valid_px_ratio, conf_thresh_eff, loss_refined_unsup is None
 
 
 @torch.no_grad()
@@ -240,6 +387,8 @@ def train(
     use_ema_teacher = bool(tr.get("use_ema_teacher", False))
     ema_alpha = float(tr.get("ema_alpha", 0.999))
     pseudo_ablation = resolve_pseudo_ablation(cfg)
+    consistency_type = resolve_consistency_type(cfg)
+    lambda_soft = float(loss_c.get("lambda_soft", 0.25))
     # Accepts true/false (YAML booleans) or the special string "partly".
     #   true     → encoder frozen for the whole training
     #   false    → encoder never frozen
@@ -381,6 +530,15 @@ def train(
     logger.info("Segmentation decoder: deeplabv3")
     if use_diffusion:
         logger.info("Pseudo-label ablation: %s", pseudo_ablation)
+    else:
+        logger.info(
+            "use_diffusion=false — unlabeled loss is view consistency only "
+            "(no diffusion-refined pseudo-label loss)"
+        )
+    if consistency_type == "combined":
+        logger.info("Consistency loss: %s (lambda_soft=%.4f)", consistency_type, lambda_soft)
+    else:
+        logger.info("Consistency loss: %s", consistency_type)
 
     if use_ema_teacher:
         ema_model = copy.deepcopy(seg_model)
@@ -400,12 +558,12 @@ def train(
         cldice_iters=int(loss_c.get("cldice_iters", 10)),
     )
 
-    diff_opt = torch.optim.AdamW(diff_model.parameters(), lr=diff_c["lr"], weight_decay=1e-4)
+    diff_opt = torch.optim.AdamW(diff_model.parameters(), lr=diff_c["lr"], weight_decay=diff_c["weight_decay"])
     diff_lrsched = torch.optim.lr_scheduler.CosineAnnealingLR(diff_opt, epochs, eta_min=1e-7)
     seg_opt = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, seg_model.parameters()),
         lr=seg_c["lr"],
-        weight_decay=5e-6,
+        weight_decay=seg_c['weight_decay'],
     )
     seg_lrsched = torch.optim.lr_scheduler.CosineAnnealingLR(seg_opt, epochs, eta_min=1e-7)
     use_amp = device.type == "cuda"
@@ -428,21 +586,45 @@ def train(
         "sup_dice": [],
         "sup_cldice": [],
         "sup_bound": [],
+        # raw (unweighted) unsup-loss components.
+        # total loss_unsup (raw) = loss_refined_unsup + loss_view_unsup.
+        # Weighted contribution to the objective is:
+        #   pseudo_w * unsup_refined + lambda_view * unsup_view
+        # so unsup_refined, unsup_view and pseudo_weight are enough to
+        # reconstruct the epoch's weighted loss_unsup (lambda_view from yaml).
+        "unsup_refined": [],
+        "unsup_view": [],
+        "unsup_total": [],
+        "unsup_rect": [],   # diffrect only (weak_weak term)
+        "unsup_fix": [],    # diffrect only (strong_weak term)
+        "pseudo_weight": [],
     }
     grad_clip = tr.get("grad_clip", 1.0)
     noise_frac = tr["noise_frac"]
+    # Confidence-threshold curriculum (hybrid: strict warmup -> percentile)
+    tau_max = float(loss_c.get("tau_max", 0.95))
+    tau_min = float(loss_c.get("tau_min", 0.70))
+    conf_strict_epochs = int(loss_c.get("conf_strict_epochs", 5))
+    keep_frac_min = float(loss_c.get("keep_frac_min", 0.10))
+    keep_frac_max = float(loss_c.get("keep_frac_max", 0.60))
 
     for epoch in range(1, epochs + 1):
         is_warmup_phase = (epoch <= warmup_epochs) and is_warmup
-        conf_thresh = get_confidence_threshold(epoch)
+        strict, keep_frac = get_conf_schedule(
+            epoch, epochs, warmup_epochs, is_warmup,
+            conf_strict_epochs, keep_frac_min, keep_frac_max,
+        )
         phase = "WARMUP" if is_warmup_phase else "SEMI-SUP"
-        logger.info("Epoch %d/%d [%s] tau=%.2f", epoch, epochs, phase, conf_thresh)
+        conf_mode = f"strict(tau_max={tau_max:.2f})" if strict else f"percentile(keep={keep_frac:.2f})"
+        logger.info("Epoch %d/%d [%s] conf=%s", epoch, epochs, phase, conf_mode)
 
         # Unfreeze encoder when transitioning out of warmup (freeze_enc="partly")
         if freeze_enc_mode == "partly" and not is_warmup_phase and not encoder_unfrozen:
             seg_model.unfreeze_encoder()
             seg_opt = torch.optim.AdamW(
-                seg_model.parameters(), lr=seg_c["lr_unfrozen"], weight_decay=1e-4
+                seg_model.parameters(), 
+                lr=seg_c["lr_unfrozen"], 
+                weight_decay=seg_c["weight_decay_unfrozen"],
             )
             seg_lrsched = torch.optim.lr_scheduler.CosineAnnealingLR(
                 seg_opt, epochs - epoch + 1, eta_min=1e-7
@@ -515,9 +697,6 @@ def train(
             history["diff_loss"].append(avg_diff)
 
         # Epoch-level constants — compute once, reuse across all mini-batches
-        tau_max = float(loss_c.get("tau_max", 0.90))
-        tau_min = float(loss_c.get("tau_min", 0.60))
-        denom = max(tau_max - tau_min, 1e-6)
         pseudo_w = get_pseudo_weight(
             epoch, epochs, loss_c["lambda_pseudo"],
             warmup_epochs if is_warmup else 0,
@@ -525,10 +704,13 @@ def train(
         lambda_view = loss_c["lambda_view"]
 
         seg_model.train()
-        total_sup = total_unsup = total_view = 0.0
+        total_sup = total_refined_unsup = total_view = 0.0
         total_bce = total_dice = total_cldice = total_bound = 0.0
+        total_view_unsup = 0.0
+        total_rect = total_fix = 0.0
         skipped = 0
         valid_px_ratios = []
+        conf_thresh_vals = []
         unsup_iter = iter(unsup_ld)
 
         seg_opt.zero_grad(set_to_none=True)
@@ -547,8 +729,8 @@ def train(
                 _, feats_b = seg_model(img_b, txt)
                 l_view_sup = None
 
-                l_unsup = None
-                l_view_unsup = None
+                loss_refined_unsup = None
+                loss_view_unsup = None
                 if not is_warmup_phase:
                     try:
                         unsup_batch = next(unsup_iter)
@@ -561,7 +743,7 @@ def train(
                     txt_u = get_text_emb(img_ua.shape[0])
 
                     if use_diffusion:
-                        l_unsup, l_view_unsup, vp_ratio, batch_skipped = (
+                        output = (
                             compute_diffusion_unsup_losses(
                                 seg_model,
                                 diff_model,
@@ -572,39 +754,53 @@ def train(
                                 device,
                                 get_text_emb,
                                 noise_frac,
-                                conf_thresh,
+                                strict,
+                                keep_frac,
+                                tau_min,
+                                tau_max,
                                 pseudo_ablation,
+                                consistency_type,
+                                lambda_soft,
                                 ema_model,   # teacher: EMA model if enabled, else None → falls back to seg_model
                             )
                         )
+                        if pseudo_ablation == "diffrect":
+                            loss_refined_unsup, (l_rect, l_fix), loss_view_unsup, vp_ratio, conf_eff, batch_skipped = output
+                        else:
+                            loss_refined_unsup, loss_view_unsup, vp_ratio, conf_eff, batch_skipped = output
+
                         valid_px_ratios.append(vp_ratio)
+                        conf_thresh_vals.append(conf_eff)
                         if batch_skipped:
                             skipped += 1
                     else:
-                        # No diffusion: loss_unsup is feature-level view consistency.
-                        # Features (B, N, D) are normalised over the D dimension —
-                        # semantically meaningful. Logits (B, 1, H, W) normalised
-                        # over width would be geometrically meaningless.
+                        # No diffusion: unlabeled branch uses ONLY cross-view
+                        # consistency (loss_view_unsup). No refined pseudo-label
+                        # term — loss_refined_unsup stays None.
                         logits_ua, _ = seg_model(img_ua, txt_u)
                         logits_ub, _ = seg_model(img_ub, txt_u)
-                        l_view_unsup = view_consistency_loss(logits_ua, logits_ub)
-                        l_unsup = l_view_unsup
+                        loss_view_unsup = view_consistency_combined(
+                            logits_ua, logits_ub, consistency_type, lambda_soft
+                        )
+                        loss_refined_unsup = None
 
                 if is_warmup_phase:
                     # Warmup: supervised loss + view-consistency on labeled pairs
                     total_loss = l_sup
                 elif use_diffusion:
-                    # Semi-sup with diffusion: sup + view-sup + pseudo + view-unsup
+                    # Semi-sup with diffusion:
+                    #   total loss_unsup = pseudo_w * loss_refined_unsup
+                    #                      + lambda_view * loss_view_unsup
                     total_loss = l_sup
-                    if l_unsup is not None:
-                        total_loss = total_loss + pseudo_w * l_unsup
-                    if l_view_unsup is not None:
-                        total_loss = total_loss + lambda_view * l_view_unsup
+                    if loss_refined_unsup is not None:
+                        total_loss = total_loss + pseudo_w * loss_refined_unsup
+                    if loss_view_unsup is not None:
+                        total_loss = total_loss + lambda_view * loss_view_unsup
                 else:
-                    # Semi-sup without diffusion: sup + view-sup + view-unsup
+                    # Semi-sup without diffusion: sup + view-unsup only
                     total_loss = l_sup
-                    if l_unsup is not None:
-                        total_loss = total_loss + lambda_view * l_unsup
+                    if loss_view_unsup is not None:
+                        total_loss = total_loss + lambda_view * loss_view_unsup
 
             if not torch.isfinite(total_loss):
                 continue
@@ -623,8 +819,15 @@ def train(
             total_dice  += sup_comps[1]
             total_cldice += sup_comps[2]
             total_bound += sup_comps[3]
-            if l_unsup is not None:
-                total_unsup += l_unsup.item()
+            if loss_refined_unsup is not None:
+                total_refined_unsup += loss_refined_unsup.item()
+            if loss_view_unsup is not None:
+                total_view_unsup += loss_view_unsup.item()
+            if not is_warmup_phase and use_diffusion and pseudo_ablation == "diffrect":
+                if l_rect is not None:
+                    total_rect += l_rect.item()
+                if l_fix is not None:
+                    total_fix += l_fix.item()
 
             if accum_count >= accum_steps:
                 if use_amp and seg_scaler is not None:
@@ -657,27 +860,45 @@ def train(
         n_sup = max(len(sup_ld), 1)
         history["seg_sup"].append(total_sup / n_sup)
         history["seg_view"].append(total_view / n_sup)
-        history["seg_unsup"].append(
-            total_unsup / max(n_sup - skipped, 1) if not is_warmup_phase else 0.0
-        )
         history["sup_bce"].append(total_bce / n_sup)
         history["sup_dice"].append(total_dice / n_sup)
         history["sup_cldice"].append(total_cldice / n_sup)
         history["sup_bound"].append(total_bound / n_sup)
+        if not is_warmup_phase:
+            denom_unsup = max(n_sup - skipped, 1)
+            refined_avg = total_refined_unsup / denom_unsup
+            view_avg = total_view_unsup / n_sup
+            history["unsup_refined"].append(refined_avg)
+            history["unsup_view"].append(view_avg)
+            history["unsup_total"].append(refined_avg + view_avg)
+            history["unsup_rect"].append(total_rect / denom_unsup)
+            history["unsup_fix"].append(total_fix / denom_unsup)
+            # seg_unsup is the FULL unsup loss actually added to the objective,
+            # i.e. the weighted sum of both terms (not the refined term alone):
+            #   seg_unsup = pseudo_w * loss_refined_unsup + lambda_view * loss_view_unsup
+            history["seg_unsup"].append(pseudo_w * refined_avg + lambda_view * view_avg)
+        else:
+            for _k in ("unsup_refined", "unsup_view", "unsup_total",
+                       "unsup_rect", "unsup_fix"):
+                history[_k].append(0.0)
+            history["seg_unsup"].append(0.0)
+        history["pseudo_weight"].append(pseudo_w)
         avg_vp = float(np.mean(valid_px_ratios)) if valid_px_ratios else 0.0
+        avg_conf = float(np.mean(conf_thresh_vals)) if conf_thresh_vals else 0.0
 
         metrics = evaluate(seg_model, val_ld, device, get_text_emb)
         history["val_dice"].append(metrics["dice"])
         history["val_iou"].append(metrics["iou"])
 
         logger.info(
-            "diff=%.4f sup=%.4f unsup=%.4f val_dice=%.4f iou=%.4f valid_px=%.3f skipped=%d",
+            "diff=%.4f sup=%.4f unsup_w=%.4f val_dice=%.4f iou=%.4f valid_px=%.3f conf_thr=%.3f skipped=%d",
             avg_diff,
             history["seg_sup"][-1],
             history["seg_unsup"][-1],
             metrics["dice"],
             metrics["iou"],
             avg_vp,
+            avg_conf,
             skipped,
         )
         logger.info(
@@ -687,6 +908,20 @@ def train(
             history["sup_cldice"][-1],
             history["sup_bound"][-1],
         )
+        logger.info(
+            "  unsup components (raw) → refined=%.4f  view=%.4f  total=%.4f  (pseudo_w=%.4f, lambda_view=%.4f)",
+            history["unsup_refined"][-1],
+            history["unsup_view"][-1],
+            history["unsup_total"][-1],
+            pseudo_w,
+            lambda_view,
+        )
+        if pseudo_ablation == "diffrect":
+            logger.info(
+                "  unsup refined split (raw) → rect=%.4f  fix=%.4f",
+                history["unsup_rect"][-1],
+                history["unsup_fix"][-1],
+            )
 
         if metrics["iou"] > best_iou:
             best_iou = metrics["iou"]
@@ -700,38 +935,92 @@ def train(
                 logger.info("Early stopping at epoch %d", epoch)
                 break
 
-    fig, axes = plt.subplots(3, 2, figsize=(14, 12))
+    # ----------------------------- Training curves --------------------------
+    # Number of warmup epochs actually used (0 when warmup disabled). During
+    # warmup the unsup loss is 0; we blank the single transition point so the
+    # curve doesn't draw a steep diagonal from 0 up to the first real value.
+    n_warmup = warmup_epochs if is_warmup else 0
+    lb = loss_c.get("lambda_bce", 1.0)
+    ld = loss_c.get("lambda_dice", 1.0)
+    lc = loss_c["lambda_cldice"]
+    lbo = loss_c["lambda_bound"]
+    lv = loss_c["lambda_view"]
 
-    axes[0, 0].plot(history["diff_loss"], "b-o")
-    axes[0, 0].set_title("Diffusion Loss")
-    axes[0, 0].grid(True)
+    def _arr(key: str) -> np.ndarray:
+        return np.array(history[key], dtype=float)
 
-    axes[0, 1].plot(history["seg_sup"],   "g-o", label="Sup (total)")
-    axes[0, 1].plot(history["seg_unsup"], "r-s", label="Unsup")
-    axes[0, 1].legend()
-    axes[0, 1].set_title("Seg Losses (weighted total)")
-    axes[0, 1].grid(True)
+    def _break_warmup(values: np.ndarray) -> np.ndarray:
+        arr = np.array(values, dtype=float)
+        if 0 < n_warmup < len(arr):
+            arr[n_warmup - 1] = np.nan  # blank warmup→semi-sup transition
+        return arr
 
-    axes[1, 0].plot(history["val_dice"], color="purple", marker="o")
-    axes[1, 0].set_title("Val Dice")
-    axes[1, 0].grid(True)
+    def _mark_max(ax, values, color: str) -> None:
+        arr = np.asarray(values, dtype=float)
+        if arr.size == 0 or np.all(np.isnan(arr)):
+            return
+        idx = int(np.nanargmax(arr))
+        ax.scatter([idx], [arr[idx]], color=color, s=140, marker="*",
+                   zorder=5, edgecolors="black", linewidths=0.6)
+        ax.annotate(f"{arr[idx]:.4f} @ ep{idx + 1}", (idx, arr[idx]),
+                    textcoords="offset points", xytext=(0, 9),
+                    ha="center", fontsize=8, color=color)
 
-    axes[1, 1].plot(history["val_iou"], color="orange", marker="s")
-    axes[1, 1].set_title("Val IoU")
-    axes[1, 1].grid(True)
+    fig = plt.figure(figsize=(15, 14))
+    gs = fig.add_gridspec(3, 2)
+    ax_diff = fig.add_subplot(gs[0, 0])
+    ax_seg = fig.add_subplot(gs[0, 1])
+    ax_sup = fig.add_subplot(gs[1, :])        # spans [1,0] and [1,1]
+    ax_unsup = fig.add_subplot(gs[2, 0])
+    ax_val = fig.add_subplot(gs[2, 1])
 
-    # Raw (unweighted) sup-loss components
-    axes[2, 0].plot(history["sup_bce"],  "b-o",  label="BCE")
-    axes[2, 0].plot(history["sup_dice"], "g-s",  label="Dice")
-    axes[2, 0].legend()
-    axes[2, 0].set_title("Sup Components — BCE & Dice (raw)")
-    axes[2, 0].grid(True)
+    # [0,0] diffusion loss
+    ax_diff.plot(history["diff_loss"], "b-o")
+    ax_diff.set_title("Diffusion Loss")
+    ax_diff.set_xlabel("epoch")
+    ax_diff.grid(True)
 
-    axes[2, 1].plot(history["sup_cldice"], "r-o", label="CLDice")
-    axes[2, 1].plot(history["sup_bound"],  "m-s", label="Boundary")
-    axes[2, 1].legend()
-    axes[2, 1].set_title("Sup Components — CLDice & Boundary (raw)")
-    axes[2, 1].grid(True)
+    # [0,1] weighted seg losses; total = the loss used for the gradient step
+    sup_w = _arr("seg_sup")
+    unsup_w = _arr("seg_unsup")
+    total_w = sup_w + unsup_w
+    ax_seg.plot(sup_w, "g-o", label="loss_sup")
+    ax_seg.plot(_break_warmup(unsup_w), "r-s", label="loss_unsup")
+    ax_seg.plot(total_w, "k-^", label="loss_total")
+    ax_seg.legend()
+    ax_seg.set_title("Seg Losses")
+    ax_seg.set_xlabel("epoch")
+    ax_seg.grid(True)
+
+    # [1,:] weighted sup components — these sum to loss_sup
+    ax_sup.plot(_arr("sup_bce") * lb,    "b-o", label=f"BCE")
+    ax_sup.plot(_arr("sup_dice") * ld,   "g-s", label=f"Dice")
+    ax_sup.plot(_arr("sup_cldice") * lc, "r-^", label=f"CLDice")
+    ax_sup.plot(_arr("sup_bound") * lbo, "m-d", label=f"Boundary")
+    ax_sup.legend(ncol=4)
+    ax_sup.set_title("Sup Components")
+    ax_sup.set_xlabel("epoch")
+    ax_sup.grid(True)
+
+    # [2,0] weighted unsup components (refined x pseudo_w, view x lambda_view)
+    refined_w = _arr("unsup_refined") * _arr("pseudo_weight")
+    view_w = _arr("unsup_view") * lv
+    ax_unsup.plot(_break_warmup(refined_w), "c-o", label="loss_refined")
+    ax_unsup.plot(_break_warmup(view_w), "y-s", label=f"loss_consistency_view")
+    ax_unsup.legend()
+    ax_unsup.set_title("Unsup Components")
+    ax_unsup.set_xlabel("epoch")
+    ax_unsup.grid(True)
+
+    # [2,1] validation Dice & IoU, best value highlighted on each line
+    ax_val.plot(history["val_dice"], color="purple", marker="o", label="val Dice")
+    ax_val.plot(history["val_iou"], color="orange", marker="s", label="val IoU")
+    _mark_max(ax_val, history["val_dice"], "purple")
+    _mark_max(ax_val, history["val_iou"], "orange")
+    ax_val.legend()
+    ax_val.set_title("Val Dice & IoU")
+    ax_val.set_xlabel("epoch")
+    ax_val.grid(True)
 
     plt.tight_layout()
     plot_path = Path(log_dir) / "training_curves.png"
