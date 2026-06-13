@@ -15,9 +15,4 @@ visualization/
 **/visualization/
 CONCH/
 
-#uv file
-.python-version
-pyproject.toml
-uv.lock
-
 .env
